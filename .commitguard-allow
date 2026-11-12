@@ -1,0 +1,3 @@
+# Reviewed exceptions to commitguard. One glob per line, matched against the
+# repo-relative path or the file name. Keep this list short and justified.
+# examples/tiny_demo_model.onnx   # 200 KB toy model for the README demo
