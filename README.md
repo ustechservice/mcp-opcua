@@ -32,7 +32,20 @@ against the allowlist, type, min/max, allowed values, max step and min interval 
 then re-checked against a fresh read at confirm time and verified by read-back afterwards.
 See [`examples/config.sim-writes.yaml`](examples/config.sim-writes.yaml) and [ADR 0001](docs/adr/0001-safety-model.md).
 
-- Human approval: `writes.require_human: true`, then `mcp-opcua approve <token> --config ...`
+- Allowlist: `pattern` is an exact, canonical NodeId (`ns=2;s=X`, not `ns=02;s=X`). Set `glob: true`
+  on a rule to use fnmatch wildcards. A node matching two rules is rejected. Steps (`max_rate_of_change`)
+  need `min_interval_s >= 1`.
+- Human approval: `writes.require_human: true`. The operator runs `mcp-opcua approve --config ...` to list
+  pending writes, then `mcp-opcua approve <id> --config ...` in a terminal to review and approve one. The
+  approval is bound to that exact node and value; the agent never sees the approval id.
+  **Limit:** approvals are not signed. Anyone who can write to `approvals_dir` can approve, so this
+  is not a boundary against an agent that has a shell on the host. It protects against an agent that
+  only reaches the server through MCP. Signed approvals are planned.
+- Relative paths in the config (`kill_switch_file`, `approvals_dir`, `audit.path`, certs) resolve
+  against the config file's directory (`~` is expanded). `kill_switch_file` is required when writes are
+  enabled, and the server logs its resolved path at startup. Stepped tags need `min_interval_s >= 1`.
+- HTTP: streamable HTTP has no auth in v0.1. DNS-rebinding protection is always on (add Host values
+  with `--allowed-host`), and the server refuses to serve writes on a non-loopback address.
 - Kill switch: create the `kill_switch_file` or set `MCP_OPCUA_KILL=1`. Takes effect on the next call, no restart.
 - Audit: every call goes to hash-chained JSONL; check it with `mcp-opcua audit verify audit.jsonl`.
 
