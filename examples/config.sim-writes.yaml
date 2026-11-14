@@ -1,0 +1,32 @@
+# Gated writes against the bundled SIMULATOR. Shows every safety layer from docs/adr/0001.
+connection:
+  endpoint: opc.tcp://localhost:4840/bottling/
+  security_mode: "None"
+  allow_insecure: true
+
+writes:
+  enabled: true
+  require_human: true             # agent cannot confirm alone: run `mcp-opcua approve <token>`
+  token_ttl_s: 60
+  kill_switch_file: .mcp-opcua/KILL   # `touch` it to block all writes instantly
+  kill_switch_env: MCP_OPCUA_KILL
+  tags:
+    - pattern: "ns=2;s=ConveyorSpeed"
+      type: float
+      min: 0.0
+      max: 2.5
+      max_rate_of_change: 0.3     # largest single step, m/s
+      min_interval_s: 10
+    - pattern: "ns=2;s=FillTarget"
+      type: float
+      min: 490.0
+      max: 510.0
+      max_rate_of_change: 2.0
+      min_interval_s: 30
+    - pattern: "ns=2;s=LineState"
+      type: str
+      allowed: ["Running", "Stopped"]   # agent may stop the line, never set Fault
+
+audit:
+  path: audit.jsonl
+  hash_chain: true

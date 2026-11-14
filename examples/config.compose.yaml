@@ -1,0 +1,11 @@
+# Used by docker-compose.yml. Simulator only, read-only.
+connection:
+  endpoint: opc.tcp://sim:4840/bottling/
+  security_mode: "None"
+  allow_insecure: true
+
+writes:
+  enabled: false
+
+audit:
+  path: /tmp/audit.jsonl

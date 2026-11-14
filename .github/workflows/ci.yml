@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Commercial
+# Copyright (c) 2026 USTechService Corporation
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: astral-sh/setup-uv@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: uv sync
+      - run: uv run ruff check . && uv run ruff format --check .
+      - run: uv run mypy src
+      # Integration tests start the simulator in-process on a random port.
+      - run: uv run pytest -q
+      - run: python scripts/commitguard.py --all
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build --wait --wait-timeout 120
+      - run: docker compose ps && docker compose logs mcp | tail -20
+      - if: always()
+        run: docker compose down

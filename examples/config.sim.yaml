@@ -1,0 +1,14 @@
+# mcp-opcua config for the bundled simulator ONLY.
+# security_mode None and anonymous auth are refused unless allow_insecure is true.
+# Never use allow_insecure, or enable writes, against production equipment.
+connection:
+  endpoint: opc.tcp://localhost:4840/bottling/
+  security_mode: "None"
+  allow_insecure: true
+
+writes:
+  enabled: false          # read-only demo. See config.sim-writes.yaml for the gated write path.
+
+audit:
+  path: audit.jsonl
+  hash_chain: true
