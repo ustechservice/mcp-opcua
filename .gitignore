@@ -63,3 +63,10 @@ node_modules/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# --- mcp-opcua ---
+.hypothesis/
+.omc/
+.mcp-opcua/
+audit.jsonl
+*.jsonl.bak
