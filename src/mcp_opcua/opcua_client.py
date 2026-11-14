@@ -168,6 +168,9 @@ class OpcUaClient:
         return out
 
     # -- writes (only called by server.py after policy passes) ----------------
+    async def variant_type(self, node_id: str) -> str:
+        return str((await self.node(node_id).read_data_type_as_variant_type()).name)
+
     async def write(self, node_id: str, value: Any) -> None:
         n = self.node(node_id)
         vtype = await n.read_data_type_as_variant_type()
@@ -178,9 +181,17 @@ class OpcUaClient:
         if len(self._subs) >= self.sub_cfg.max_subscriptions:
             raise ValueError(f"subscription limit ({self.sub_cfg.max_subscriptions}) reached")
         sampling_ms = max(sampling_ms, self.sub_cfg.min_sampling_ms)
+        nodes = [self.node(n) for n in node_ids]  # reject bad NodeIds before touching the server
         handler = _BufferHandler(deque(maxlen=self.sub_cfg.max_buffer))
         sub = await self.client.create_subscription(sampling_ms, handler)
-        await sub.subscribe_data_change([self.node(n) for n in node_ids])
+        try:
+            handles = await sub.subscribe_data_change(nodes)
+            bad = [n for n, h in zip(node_ids, handles, strict=True) if not isinstance(h, int)]
+            if bad:  # asyncua reports per-item failures as StatusCode values, not exceptions
+                raise ValueError(f"cannot monitor {bad}")
+        except BaseException:
+            await asyncio.shield(sub.delete())  # don't leak a server-side subscription
+            raise
         sid = self._next_sub
         self._next_sub += 1
         self._subs[sid] = _Sub(handler, sub, node_ids)

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -12,12 +14,16 @@ from typing import Any
 from mcp.server.mcpserver import MCPServer
 
 from mcp_opcua.audit import AuditLog
-from mcp_opcua.config import Config
+from mcp_opcua.config import Config, canonical_node_id
 from mcp_opcua.opcua_client import OpcUaClient
-from mcp_opcua.policy import PolicyError, WritePolicy
+from mcp_opcua.policy import PolicyError, WritePolicy, token_ref
 
 MAX_READ_NODES = 100
 MAX_POLL_ITEMS = 1000
+# Result fields copied into the audit record.
+_AUDIT_FIELDS = ("node_id", "requested", "before", "after", "confirmed_by")
+
+log = logging.getLogger(__name__)
 
 
 def _values_match(a: Any, b: Any) -> bool:
@@ -34,22 +40,31 @@ class Service:
 
     def __init__(self, cfg: Config, ua: OpcUaClient, audit: AuditLog, policy: WritePolicy) -> None:
         self.cfg, self.ua, self.audit, self.policy = cfg, ua, audit, policy
+        self._locks: dict[str, asyncio.Lock] = {}
 
     async def _audited(
-        self, tool: str, args: dict[str, Any], fn: Callable[[], Awaitable[dict[str, Any]]]
+        self,
+        tool: str,
+        args: dict[str, Any],
+        fn: Callable[[], Awaitable[dict[str, Any]]],
+        ctx: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Run a tool and always append one audit record. `ctx` lets fn add fields (node_id,
+        token_ref...) that must be logged even if it fails halfway."""
         t0 = time.perf_counter()
+        ctx = {} if ctx is None else ctx
+        status = "error"
         try:
             result = await fn()
             status = result.get("status", "ok")
-            extra = {k: result[k] for k in ("before", "after", "confirmed_by") if k in result}
+            ctx.update({k: result[k] for k in _AUDIT_FIELDS if k in result})
             return result
         except PolicyError as e:
-            status, extra = f"rejected:{e.code}", {}
+            status = f"rejected:{e.code}"
             return {"status": "rejected", "code": e.code, "error": str(e)}
-        except (ValueError, RuntimeError) as e:
-            status, extra = "error", {}
-            return {"status": "error", "error": str(e)}
+        except Exception as e:
+            log.exception("%s failed", tool)
+            return {"status": "error", "error": f"{type(e).__name__}: {e}"}
         finally:
             self.audit.append(
                 client="mcp",
@@ -57,7 +72,7 @@ class Service:
                 args=args,
                 status=status,
                 latency_ms=round((time.perf_counter() - t0) * 1000, 2),
-                **extra,
+                **ctx,
             )
 
     async def browse(self, node_id: str, depth: int) -> dict[str, Any]:
@@ -111,19 +126,23 @@ class Service:
 
     async def write(self, node_id: str | None, value: Any, confirm: str | None) -> dict[str, Any]:
         args = {"node_id": node_id, "value": value, "confirm": bool(confirm)}
+        ctx: dict[str, Any] = {}
         if confirm:
-            return await self._audited("write", args, lambda: self._execute(confirm))
-        return await self._audited("write", args, lambda: self._plan(node_id, value))
+            return await self._audited("write", args, lambda: self._execute(confirm, ctx), ctx)
+        return await self._audited("write", args, lambda: self._plan(node_id, value, ctx), ctx)
 
-    async def _plan(self, node_id: str | None, value: Any) -> dict[str, Any]:
+    async def _plan(self, node_id: str | None, value: Any, ctx: dict[str, Any]) -> dict[str, Any]:
         if not node_id:
             raise ValueError("node_id is required to plan a write")
+        node_id = ctx["node_id"] = canonical_node_id(node_id)
         # Cheap gates first so a disabled/unlisted tag never touches the network.
         self.policy.gate()
         self.policy.rule_for(node_id)
         current = await self.ua.read_value(node_id)
-        p = self.policy.plan(node_id, value, current)
-        return {
+        vtype = await self.ua.variant_type(node_id)
+        p = self.policy.plan(node_id, value, current, vtype)
+        ctx["token_ref"] = p.token_ref
+        out = {
             "status": "planned",
             "node_id": p.node_id,
             "current": p.current,
@@ -131,31 +150,57 @@ class Service:
             "checks_passed": list(p.checks),
             "confirmation_token": p.token,
             "expires_in_s": self.cfg.writes.token_ttl_s,
-            "requires_human": self.cfg.writes.require_human,
-            "next": "call write(confirm=<token>)"
-            + (
-                " after a human runs `mcp-opcua approve <token>`"
-                if self.cfg.writes.require_human
-                else ""
-            ),
+            "requires_human": p.approval_id is not None,
+            "next": "call write(confirm=<token>)",
         }
+        if p.approval_id:
+            # The approval id goes to the operator via `mcp-opcua approve`, never to the agent.
+            out["next"] = (
+                "ask a human operator to approve this write, then call write(confirm=<token>) "
+                "before it expires"
+            )
+        return out
 
-    async def _execute(self, token: str) -> dict[str, Any]:
+    async def _execute(self, token: str, ctx: dict[str, Any]) -> dict[str, Any]:
+        ctx["token_ref"] = token_ref(token)  # links rejected confirms to their plan, too
         p = self.policy.redeem(token)
-        # Re-validate against a fresh read: the plant may have moved since the plan.
-        before = await self.ua.read_value(p.node_id)
-        self.policy.check(p.node_id, p.proposed, before)
-        await self.ua.write(p.node_id, p.proposed)
-        self.policy.record_write(p.node_id)
-        after = await self.ua.read_value(p.node_id)
-        ok = _values_match(after, p.proposed)
+        ctx.update(node_id=p.node_id, requested=p.proposed)
+        # check() + reserve_slot() have no await between them, which is what stops two confirms
+        # both passing min_interval. The lock keeps that true if an await is ever added there,
+        # and keeps fresh-read -> write -> read-back for one node from interleaving.
+        async with self._locks.setdefault(p.node_id, asyncio.Lock()):
+            # Re-validate against a fresh read: the plant may have moved since the plan.
+            before = await self.ua.read_value(p.node_id)
+            self.policy.check(p.node_id, p.proposed, before)
+            self.policy.reserve_slot(p.node_id)
+            # Logged before the write: if the audit log can't be written, nothing is written.
+            self.audit.append(
+                client="mcp", tool="write_intent", args={}, status="intent", before=before, **ctx
+            )
+            try:
+                await self.ua.write(p.node_id, p.proposed)
+            except Exception as e:
+                raise RuntimeError(f"write outcome unknown, it may have landed: {e}") from e
+            confirmed_by = "human" if p.approval_id else "agent"
+            try:
+                after = await self.ua.read_value(p.node_id)
+            except Exception as e:
+                log.warning("read-back of %s failed: %s", p.node_id, e)
+                return {
+                    "status": "readback_failed",
+                    "node_id": p.node_id,
+                    "before": before,
+                    "requested": p.proposed,
+                    "confirmed_by": confirmed_by,
+                    "error": f"write sent but read-back failed: {type(e).__name__}: {e}",
+                }
         return {
-            "status": "written" if ok else "readback_mismatch",
+            "status": "written" if _values_match(after, p.proposed) else "readback_mismatch",
             "node_id": p.node_id,
             "before": before,
             "after": after,
             "requested": p.proposed,
-            "confirmed_by": "human" if self.cfg.writes.require_human else "agent",
+            "confirmed_by": confirmed_by,
         }
 
 

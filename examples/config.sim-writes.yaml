@@ -6,9 +6,9 @@ connection:
 
 writes:
   enabled: true
-  require_human: true             # agent cannot confirm alone: run `mcp-opcua approve <token>`
+  require_human: true             # agent cannot confirm alone: operator runs `mcp-opcua approve`
   token_ttl_s: 60
-  kill_switch_file: .mcp-opcua/KILL   # `touch` it to block all writes instantly
+  kill_switch_file: .mcp-opcua/KILL   # relative to THIS file: touch examples/.mcp-opcua/KILL
   kill_switch_env: MCP_OPCUA_KILL
   tags:
     - pattern: "ns=2;s=ConveyorSpeed"

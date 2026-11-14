@@ -8,9 +8,24 @@ import os
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Self
+from urllib.parse import urlparse
 
 import yaml
+from asyncua import ua
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+def canonical_node_id(node_id: str) -> str:
+    """One spelling per node (`ns=02;s=X` -> `ns=2;s=X`). Policy matching, rate limiting and the
+    actual OPC UA call all use this form, so they can never disagree about which node is meant."""
+    try:
+        return str(ua.NodeId.from_string(node_id).to_string())
+    except Exception as e:  # asyncua raises several types for bad NodeId strings
+        raise ValueError(f"invalid NodeId {node_id!r}: {e}") from e
+
+
+# Floor for min_interval_s on stepped tags: longer than a typical PLC scan + read-back.
+MIN_STEP_INTERVAL_S = 1.0
 
 
 class _Strict(BaseModel):
@@ -76,6 +91,8 @@ class TagRule(_Strict):
     """Constraints for writable tags. `pattern` is a NodeId or fnmatch glob."""
 
     pattern: str = Field(min_length=1)
+    # Exact NodeId match by default. `glob: true` enables fnmatch ([...] and * are special).
+    glob: bool = False
     type: Literal["bool", "int", "float", "str"]
     min: float | None = None
     max: float | None = None
@@ -92,6 +109,15 @@ class TagRule(_Strict):
             self.min is not None or self.max is not None or self.max_rate_of_change is not None
         ):
             raise ValueError(f"{self.pattern}: numeric constraints on a {self.type} tag")
+        if not self.glob and canonical_node_id(self.pattern) != self.pattern:
+            raise ValueError(
+                f"{self.pattern}: write it as {canonical_node_id(self.pattern)!r} (canonical form)"
+            )
+        if self.max_rate_of_change is not None and self.min_interval_s < MIN_STEP_INTERVAL_S:
+            # Otherwise steps can stack before the PLC applies the last one (stale read-back).
+            raise ValueError(
+                f"{self.pattern}: max_rate_of_change needs min_interval_s >= {MIN_STEP_INTERVAL_S}"
+            )
         return self
 
 
@@ -108,6 +134,8 @@ class WritesConfig(_Strict):
     def _check(self) -> Self:
         if self.enabled and not self.tags:
             raise ValueError("writes.enabled=true with an empty allowlist")
+        if self.enabled and self.kill_switch_file is None:
+            raise ValueError("writes.enabled=true requires kill_switch_file (runtime kill switch)")
         return self
 
 
@@ -130,9 +158,53 @@ class Config(_Strict):
     browse_max_depth: int = Field(default=3, ge=1, le=10)
     browse_max_nodes: int = Field(default=500, ge=1, le=10_000)
 
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        host = urlparse(self.connection.endpoint).hostname or ""
+        if self.connection.allow_insecure and self.writes.enabled and host not in _SIM_HOSTS:
+            raise ValueError(
+                f"allow_insecure with writes.enabled is only allowed for the simulator "
+                f"({', '.join(sorted(_SIM_HOSTS))}), not {host!r}"
+            )
+        return self
+
+
+_SIM_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "sim"})
+
 
 def load_config(path: Path) -> Config:
+    """Load and validate. Relative paths resolve against the config file's directory, never
+    the process CWD (MCP hosts launch servers from arbitrary directories)."""
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"{path}: expected a mapping at top level")
-    return Config.model_validate(data)
+    cfg = Config.model_validate(data)
+    base = path.resolve().parent
+
+    def fix(p: Path | None) -> Path | None:
+        if p is None:
+            return None
+        p = p.expanduser()
+        return p if p.is_absolute() else (base / p).resolve()
+
+    w, a, c = cfg.writes, cfg.audit, cfg.connection
+    auth = c.auth.model_copy(
+        update={
+            "client_cert_file": fix(c.auth.client_cert_file),
+            "client_key_file": fix(c.auth.client_key_file),
+        }
+    )
+    return cfg.model_copy(
+        update={
+            "writes": w.model_copy(
+                update={
+                    "kill_switch_file": fix(w.kill_switch_file),
+                    "approvals_dir": fix(w.approvals_dir),
+                }
+            ),
+            "audit": a.model_copy(update={"path": fix(a.path)}),
+            "connection": c.model_copy(
+                update={"server_cert_file": fix(c.server_cert_file), "auth": auth}
+            ),
+        }
+    )

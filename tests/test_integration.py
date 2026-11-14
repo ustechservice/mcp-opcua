@@ -55,7 +55,16 @@ async def _svc(endpoint: str, tmp_path: Path, writes: dict[str, Any] | None = No
 SPEED = "ns=2;s=ConveyorSpeed"
 WRITES = {
     "enabled": True,
-    "tags": [{"pattern": SPEED, "type": "float", "min": 0, "max": 2.5, "max_rate_of_change": 0.5}],
+    "tags": [
+        {
+            "pattern": SPEED,
+            "type": "float",
+            "min": 0,
+            "max": 2.5,
+            "max_rate_of_change": 0.5,
+            "min_interval_s": 1,
+        }
+    ],
 }
 
 
