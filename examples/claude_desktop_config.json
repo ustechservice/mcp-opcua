@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "opcua-sim": {
+      "command": "uvx",
+      "args": ["mcp-opcua", "serve", "--config", "/absolute/path/to/examples/config.sim.yaml"]
+    }
+  }
+}
