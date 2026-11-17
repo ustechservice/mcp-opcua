@@ -51,6 +51,7 @@ See [`examples/config.sim-writes.yaml`](examples/config.sim-writes.yaml) and [AD
 
 > Only point this at production equipment with a reviewed allowlist, `require_human: true`, and
 > `SignAndEncrypt`. The examples target the bundled simulator only.
+> Read the [threat model](docs/THREAT_MODEL.md) first: it lists what this does not stop.
 
 ## License
 Dual-licensed under [AGPL-3.0](LICENSE) or a [commercial license](COMMERCIAL.md) from USTechService Corporation.
